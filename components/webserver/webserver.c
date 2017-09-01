@@ -7,13 +7,22 @@
 #include <netinet/in.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_vfs_fat.h"
+#include "driver/sdmmc_host.h"
+#include "driver/sdmmc_defs.h"
+#include "sdmmc_cmd.h"
 /* Utils includes. */
 #include "esp_log.h"
 #include "event.h"
 #include "http.h"
 #include "webserver.h"
-
+#include "cJSON.h"
 #define TAG "webserver:"
+
+
+#define GPIO_OUTPUT_IO_0    16
+#define GPIO_OUTPUT_PIN_SEL  ((1<<GPIO_OUTPUT_IO_0))
+
 
 static uint32_t http_url_length=0;
 static uint32_t http_body_length=0;
@@ -23,8 +32,6 @@ static char* http_url=NULL;
 
 static int32_t socket_fd, client_fd;
 #define RES_HEAD "HTTP/1.1 200 OK\r\nContent-type: %s\r\nTransfer-Encoding: chunked\r\n\r\n"
-static const char* HTML="text/html";
-static const char* JSON="application/json";
 static char chunk_len[15];
 
 
@@ -69,43 +76,114 @@ static int url_callback(http_parser* a, const char *at, size_t length){
     return 0;
 }
 static void chunk_end(int socket){
-	write(socket, "\r\n0\r\n\r\n", 7);
+	write(socket, "0\r\n\r\n", 7);
 }
 
 typedef struct
 {
   char* url;
-  void(*handle)(http_parser* a,char* body);
+  void(*handle)(http_parser* a,char*url,char* body);
 }HttpHandleTypeDef;
 
-void web_index(http_parser* a,char* body);
-void led_ctrl(http_parser* a,char* body);
+void web_index(http_parser* a,char*url,char* body);
+void led_ctrl(http_parser* a,char*url,char* body);
+void load_logo(http_parser* a,char*url,char* body);
+void load_esp32(http_parser* a,char*url,char* body);
+
 static void not_find();
 const HttpHandleTypeDef http_handle[]={
-	{"/",index},
+	{"/",web_index},
 	{"/api/led/",led_ctrl},
+	{"/static/logo.png",load_logo},
+	{"/static/esp32.png",load_esp32},
 };
+static void return_file(char* filename){
+	uint32_t r;
+	char* read_buf=malloc(1024);
+  	FILE* f = fopen(filename, "r");
+  	if(f==NULL){
+  		ESP_LOGE(TAG,"not find the file");
+  		return;
+  	}
+  	while(1){
+    	r=fread(read_buf,1,1024,f);
+    	if(r>0){
+    		sprintf(chunk_len,"%x\r\n",r);
+    		write(client_fd, chunk_len, strlen(chunk_len));
+	    	//printf("%s",dst_buf);
+	    	write(client_fd, read_buf, r);
+	    	write(client_fd, "\r\n", 2);
+    	}else
+    		break;
+    }
+    fclose(f);
+  	chunk_end(client_fd);
+}
 static void not_find(){
 	char *request;
-  	asprintf(&request,RES_HEAD,HTML);//html
+  	asprintf(&request,RES_HEAD,"text/html");//html
   	write(client_fd, request, strlen(request));
   	free(request);
   	sprintf(chunk_len,"%x\r\n",strlen(not_find_page));
   	write(client_fd, chunk_len, strlen(chunk_len));
   	write(client_fd, not_find_page, strlen(not_find_page));
+  	write(client_fd,"\r\n",2);
   	chunk_end(client_fd);
 }
-void web_index(http_parser* a,char* body){
+void load_logo(http_parser* a,char*url,char* body){
 	char *request;
-  	asprintf(&request,RES_HEAD,HTML);//html
+  	asprintf(&request,RES_HEAD,"image/png");//html
   	write(client_fd, request, strlen(request));
   	free(request);
-  	//chunk
-  		
+  	return_file("/sdcard/www/static/logo.png");
+}
+void load_esp32(http_parser* a,char*url,char* body){
+	char *request;
+  	asprintf(&request,RES_HEAD,"image/png");//html
+  	write(client_fd, request, strlen(request));
+  	free(request);
+  	return_file("/sdcard/www/static/esp32.png");
+}
+void web_index(http_parser* a,char*url,char* body){
+	char *request;
+  	asprintf(&request,RES_HEAD,"text/html");//html
+  	write(client_fd, request, strlen(request));
+  	free(request);
+  	return_file("/sdcard/www/index.html");
 }
 
-void led_ctrl(http_parser* a,char* body){
-
+void led_ctrl(http_parser* a,char*url,char* body){
+	char *request;
+  	asprintf(&request,RES_HEAD,"application/json");//json
+  	write(client_fd, request, strlen(request));
+  	free(request);
+  	cJSON *root=NULL;
+    root= cJSON_Parse(http_body);
+    uint8_t led=cJSON_GetObjectItem(root,"led")->valueint;
+    cJSON_Delete(root);
+    gpio_set_level(GPIO_OUTPUT_IO_0,led);
+  	root=NULL;
+	root=cJSON_CreateObject();
+	if(root==NULL){
+		ESP_LOGI(TAG,"cjson root create failed\n");
+		return NULL;
+	}
+	cJSON_AddNumberToObject(root,"err",0);
+	// cJSON_AddStringToObject(root,"cuid","esp32_whyengineer");
+	// cJSON_AddStringToObject(root,"token",access_token);
+	// cJSON_AddNumberToObject(root, "rate", 8000);
+	// cJSON_AddNumberToObject(root, "channel", 1);
+	// cJSON_AddNumberToObject(root, "len", len);
+	// cJSON_AddStringToObject(root,"speech",speech);
+	char* out = cJSON_PrintUnformatted(root);
+	sprintf(chunk_len,"%x\r\n",strlen(out));
+	write(client_fd, chunk_len, strlen(chunk_len));
+	write(client_fd, out, strlen(out));
+  	write(client_fd,"\r\n",2);
+  	chunk_end(client_fd);
+	//send(client,out,strlen(out),MSG_WAITALL);
+	//printf("handle_return: %s\n", out);
+	cJSON_Delete(root);
 }
 
 static int body_done_callback (http_parser* a){
@@ -114,7 +192,7 @@ static int body_done_callback (http_parser* a){
   	ESP_LOGI(TAG,"body:%s",http_body);
   	for(int i=0;i<sizeof(http_handle)/sizeof(http_handle[0]);i++){
   		if(strcmp(http_handle[i].url,http_url)==0){
-  			http_handle[i].handle(a,http_body);
+  			http_handle[i].handle(a,http_url,http_body);
   			return 0;
   		}
   	}
@@ -196,9 +274,36 @@ int creat_socket_server(in_port_t in_port, in_addr_t in_addr)
 
 void webserver_task( void *pvParameters ){
 	int32_t lBytes;
+	esp_err_t err;
 	ESP_LOGI(TAG,"webserver start");
 	uint32_t request_cnt=0;
-	
+	//init gpio
+	gpio_config_t io_conf;
+    io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
+    io_conf.pull_down_en = 0;
+    io_conf.pull_up_en = 0;
+    gpio_config(&io_conf);
+	//init sd card
+	sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = true,
+        .max_files = 10
+    };
+    sdmmc_card_t* card;
+    err = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config, &mount_config, &card);
+    if (err != ESP_OK) {
+        if (err == ESP_FAIL) {
+            printf("Failed to mount filesystem. If you want the card to be formatted, set format_if_mount_failed = true.");
+        } else {
+            printf("Failed to initialize the card (%d). Make sure SD card lines have pull-up resistors in place.", err);
+        }
+        return;
+    }
+    sdmmc_card_print_info(stdout, card);
+
 	(void) pvParameters;
 	http_parser parser;
     http_parser_init(&parser, HTTP_REQUEST);
